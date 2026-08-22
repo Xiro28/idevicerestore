@@ -1298,7 +1298,7 @@ static int sha1_verify_fp(FILE* f, unsigned char* expected_sha1)
 	return (memcmp(expected_sha1, tsha1, 20) == 0) ? 1 : 0;
 }
 
-int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir, char** ipswfile)
+int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir, char** ipswfile, int skip_cached_verify)
 {
 	char* fwfn = strrchr(fwurl, '/');
 	if (!fwfn) {
@@ -1327,7 +1327,9 @@ int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir,
 	unsigned char zsha1[20] = {0, };
 	FILE* f = fopen(fwlfn, "rb");
 	if (f) {
-		if (memcmp(zsha1, isha1, 20) != 0) {
+		if (skip_cached_verify) {
+			logger(LL_WARNING, "Using '%s' without verifying its checksum as requested\n", fwlfn);
+		} else if (memcmp(zsha1, isha1, 20) != 0) {
 			logger(LL_INFO, "Verifying '%s'...\n", fwlfn);
 			register_progress('SHA1', "Verifying");
 			if (sha1_verify_fp(f, isha1)) {
@@ -1411,7 +1413,7 @@ int ipsw_download_latest_fw(plist_t version_data, const char* product, const cha
 
 	logger(LL_INFO, "Latest firmware is %s\n", fwfn);
 
-	int res = ipsw_download_fw(fwurl, isha1, todir, ipswfile);
+	int res = ipsw_download_fw(fwurl, isha1, todir, ipswfile, 0);
 
 	free(fwurl);
 

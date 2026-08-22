@@ -125,6 +125,13 @@ struct idevicerestore_client_t {
 	plist_t macos_variant;
 	plist_t recovery_variant;
 	char* restore_variant;
+	/* NULL-terminated list of manifest components that must never be sent to the
+	 * device, to keep a failing firmware updater out of the restore */
+	char** skip_components;
+	/* keys merged into (and overriding) the options passed to restored_start_restore */
+	plist_t restore_option_overrides;
+	/* NULL-terminated list of "KEY=VALUE" iBoot NVRAM variables to set in recovery mode */
+	char** nvram_sets;
 	char* filesystem;
 	int delete_fs;
 	int async_err;
@@ -193,6 +200,10 @@ char *generate_guid(void);
 #endif
 
 int mkdir_with_parents(const char *dir, int mode);
+
+/* Builds (and creates) the directory diagnostic output is written to for this
+ * device. Returns 0 on success. */
+int diagnostics_dir(struct idevicerestore_client_t* client, char* buf, size_t bufsize);
 
 char *get_temp_filename(const char *prefix);
 

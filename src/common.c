@@ -471,6 +471,20 @@ char *generate_guid(void)
 	return guid;
 }
 
+int diagnostics_dir(struct idevicerestore_client_t* client, char* buf, size_t bufsize)
+{
+	if (client->cache_dir) {
+		snprintf(buf, bufsize, "%s/diagnostics_%016" PRIx64, client->cache_dir, client->ecid);
+	} else {
+		snprintf(buf, bufsize, "diagnostics_%016" PRIx64, client->ecid);
+	}
+	if (mkdir_with_parents(buf, 0755) < 0) {
+		logger(LL_ERROR, "Unable to create output directory %s\n", buf);
+		return -1;
+	}
+	return 0;
+}
+
 int mkdir_with_parents(const char *dir, int mode)
 {
 	if (!dir) return -1;

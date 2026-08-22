@@ -91,6 +91,15 @@ static struct option longopts[] = {
 	{ "ignore-errors",  no_argument,       NULL,  1  },
 	{ "variant",        required_argument, NULL,  2  },
 	{ "logfile",        required_argument, NULL,  3  },
+	{ "recovery-os-only", no_argument,     NULL,  4  },
+	{ "revive",         no_argument,       NULL,  4  },
+	{ "diagnose",       no_argument,       NULL,  5  },
+	{ "skip-firmware",  required_argument, NULL,  6  },
+	{ "restore-option", required_argument, NULL,  7  },
+	{ "no-verify",      no_argument,       NULL,  8  },
+	{ "restore-option-plist", required_argument, NULL, 9 },
+	{ "no-fud",         no_argument,       NULL, 10 },
+	{ "set-nvram",      required_argument, NULL, 11 },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -125,6 +134,19 @@ static void usage(int argc, char* argv[], int err)
 	"                        firmware!\n" \
 	"  -e, --erase           Perform full restore instead of update, erasing all data\n" \
 	"                        DO NOT USE if you want to preserve user data on the device!\n" \
+	"  --recovery-os-only    Apple Silicon Mac only: reinstall the firmware and the\n" \
+	"                        recoveryOS ('Recovery Options') partition only, without\n" \
+	"                        touching the system and data volumes, so that user data\n" \
+	"                        is preserved. This is what Apple Configurator calls a\n" \
+	"                        'Revive'. Use it to make an unbootable Mac reach\n" \
+	"                        recoveryOS again (hold the power button after it reboots)\n" \
+	"                        and copy the data off from there. Also available as\n" \
+	"                        --revive. Cannot be combined with -e or -c.\n" \
+	"  --diagnose            Boot the restore ramdisk and collect what the device can\n" \
+	"                        tell about itself (hardware info, the panic log of the\n" \
+	"                        boot that failed, USB log), save it to files and exit\n" \
+	"                        without writing anything to its storage. Use this before\n" \
+	"                        attempting anything on a device holding data you need.\n" \
 	"  -y, --no-input        Non-interactive mode, do not ask for any input.\n" \
 	"                        WARNING: This will disable certain checks/prompts that\n" \
 	"                        are supposed to prevent DATA LOSS. Use with caution.\n" \
@@ -153,6 +175,36 @@ static void usage(int argc, char* argv[], int err)
 	"  -T, --ticket PATH     Use file at PATH to send as AP ticket\n" \
 	"  --variant VARIANT     Use given VARIANT to match the build identity to use,\n" \
         "                        e.g. 'Customer Erase Install (IPSW)'\n" \
+	"  --skip-firmware LIST  Do not offer the given firmware components to the device\n" \
+	"                        (comma separated, may be given more than once). The\n" \
+	"                        device only runs an updater for firmware the host has\n" \
+	"                        provided, so withholding a component keeps its updater\n" \
+	"                        out of the restore entirely. Use it when a restore dies\n" \
+	"                        in a firmware updater for hardware you don't need, e.g.\n" \
+	"                        --skip-firmware InputDevice for a failing stm update.\n" \
+	"  --no-verify           With -l, do not re-checksum an IPSW that is already\n" \
+	"                        present locally. Saves re-hashing the whole file on\n" \
+	"                        every run when repeating a restore. A freshly\n" \
+	"                        downloaded IPSW is still verified.\n" \
+	"  --restore-option KEY=VALUE\n" \
+	"                        Override or add a key in the options sent to restored\n" \
+	"                        when the restore is started (may be given more than\n" \
+	"                        once). VALUE may be true/false, a number or a string;\n" \
+	"                        KEY alone means true. Unknown keys are ignored by the\n" \
+	"                        device, so this is a way to probe restore behaviour.\n" \
+	"  --restore-option-plist KEY=PATH\n" \
+	"                        Same as --restore-option, but the value is read from\n" \
+	"                        the XML plist at PATH. Use this for options whose\n" \
+	"                        value is a dictionary or an array.\n" \
+	"  --set-nvram KEY=VALUE Set an iBoot NVRAM variable and exit, without restoring\n" \
+	"                        anything (may be given more than once). The device is\n" \
+	"                        taken to recovery mode, the variables are written and\n" \
+	"                        saved, then it is reset. Nothing is written to storage.\n" \
+	"                        e.g. --set-nvram boot-command=recover-fallback to make\n" \
+	"                        the Mac boot the fallback System Recovery.\n" \
+	"  --no-fud              Do not offer any FUD firmware to the device. Its AHT\n" \
+	"                        updater then gets no firmware data at all, which it\n" \
+	"                        detects before touching any hardware.\n" \
 	"  --ignore-errors       Try to continue the restore process after certain\n" \
 	"                        errors (like a failed baseband update)\n" \
 	"                        WARNING: This might render the device unable to boot\n" \
@@ -343,7 +395,7 @@ static void irecv_event_cb(const irecv_device_event_t* event, void *userdata)
 	}
 }
 
-int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw);
+int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw, char** skip_components);
 
 int idevicerestore_start(struct idevicerestore_client_t* client)
 {
@@ -642,7 +694,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 
 		char* ipsw = NULL;
-		res = ipsw_download_fw(fwurl, p_fwsha1, client->cache_dir, &ipsw);
+		res = ipsw_download_fw(fwurl, p_fwsha1, client->cache_dir, &ipsw, (client->flags & FLAG_NO_VERIFY) ? 1 : 0);
 		if (res != 0) {
 			free(ipsw);
 			return res;
@@ -1052,6 +1104,38 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		logger(LL_INFO, "Performing macOS restore\n");
 	}
 
+	if (client->skip_components) {
+		int i;
+		for (i = 0; client->skip_components[i]; i++) {
+			logger(LL_WARNING, "Firmware component '%s' will not be offered to the device\n", client->skip_components[i]);
+			if (!build_identity_has_component(build_identity, client->skip_components[i])) {
+				logger(LL_WARNING, "  note: '%s' is not present in this build identity anyway\n", client->skip_components[i]);
+			}
+		}
+	}
+
+	if (client->flags & FLAG_RECOVERY_OS_ONLY) {
+		if (!client->macos_variant) {
+			logger(LL_ERROR, "--recovery-os-only requires a macOS IPSW, but this BuildManifest has no '%s' variant.\n", RESTORE_VARIANT_MACOS_RECOVERY_OS);
+			return -1;
+		}
+		/* The 'macOS Customer' build identity *is* the recoveryOS variant of a macOS
+		 * IPSW. The RecoveryOS* data request handlers expect it in recovery_variant,
+		 * which is only populated from the 'RecoveryVariant' key for non-macOS IPSWs. */
+		client->recovery_variant = client->macos_variant;
+		logger(LL_INFO, "Performing recoveryOS-only restore: only the firmware and the recoveryOS partition will be written\n");
+		if (client->flags & FLAG_INTERACTIVE) {
+			int pres = prompt_user(
+			    "NOTE",
+			    "You are about to reinstall the firmware and the recoveryOS ('Recovery Options') partition of this Mac. The system and data volumes will NOT be written to, so user data is preserved. However, if this operation fails or is interrupted, the Mac may end up requiring a full (erasing) restore to boot again. Make sure the Mac stays connected and powered during the whole process.\n"
+			);
+			if (pres < 0) {
+				client->flags |= FLAG_QUIT;
+				return -1;
+			}
+		}
+	}
+
 	if (client->mode == MODE_NORMAL && !(client->flags & FLAG_ERASE) && !(client->flags & FLAG_SHSHONLY)) {
 		if (client->device_version && (compare_versions(client->device_version, client->version) > 0)) {
 			if (client->flags & FLAG_INTERACTIVE) {
@@ -1111,7 +1195,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 	/* check if all components we need are actually there */
 	logger(LL_INFO, "Checking IPSW for required components...\n");
-	if (build_identity_check_components_in_ipsw(build_identity, client->ipsw) < 0) {
+	if (build_identity_check_components_in_ipsw(build_identity, client->ipsw, client->skip_components) < 0) {
 		logger(LL_ERROR, "Could not find all required components in IPSW %s\n", client->ipsw->path);
 		return -1;
 	}
@@ -1126,7 +1210,10 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 	/* check if IPSW has OS component 'stored' in ZIP archive, otherwise we need to extract it */
 	int needs_os_extraction = 0;
-	if (client->ipsw->zip) {
+	if (client->flags & (FLAG_RECOVERY_OS_ONLY | FLAG_DIAGNOSE)) {
+		/* the system image is never sent in these modes, no need to extract it */
+		logger(LL_INFO, "Not extracting the filesystem, it is not used in this mode\n");
+	} else if (client->ipsw->zip) {
 		ipsw_file_handle_t zfile = ipsw_file_open(client->ipsw, os_path);
 		if (zfile) {
 			if (!zfile->seekable) {
@@ -1510,6 +1597,22 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		return -1;
 	}
 
+	if (client->nvram_sets && client->mode == MODE_RECOVERY) {
+		int nvres = recovery_apply_nvram(client);
+		if (nvres == 0) {
+			logger(LL_INFO, "Resetting device so it boots with the new environment.\n");
+			recovery_send_reset(client);
+		}
+		recovery_client_free(client);
+		return nvres;
+	}
+
+	if ((client->flags & FLAG_DIAGNOSE) && client->mode == MODE_RECOVERY) {
+		/* Last chance to read the iBoot NVRAM: it is only reachable from recovery
+		 * mode (iBoot stage 2), not from DFU, and not once the ramdisk has booted. */
+		recovery_dump_environment(client);
+	}
+
 	// now finally do the magic to put the device into restore mode
 	if (client->mode == MODE_RECOVERY) {
 		if (recovery_enter_restore(client, build_identity) < 0) {
@@ -1541,6 +1644,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 
 	// device is finally in restore mode, let's do this
 	if (client->mode == MODE_RESTORE) {
+		if ((client->flags & FLAG_DIAGNOSE) != 0) {
+			client->ignore_device_add_events = 1;
+			logger(LL_INFO, "Device is now in restore mode. Collecting diagnostics as requested.\n");
+			return restore_collect_diagnostics(client);
+		}
 		if ((client->flags & FLAG_NO_RESTORE) != 0) {
 			logger(LL_INFO, "Device is now in restore mode. Exiting as requested.\n");
 			return 0;
@@ -1568,6 +1676,11 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 
 	if (result == 0) {
+		if (client->flags & FLAG_RECOVERY_OS_ONLY) {
+			logger(LL_INFO, "The firmware and the recoveryOS partition have been reinstalled. The system and data volumes were left untouched.\n");
+			logger(LL_INFO, "To boot into recoveryOS, press and hold the power button of the Mac until 'Loading startup options' appears, then pick Options.\n");
+			logger(LL_INFO, "From there the data can be copied off using Disk Utility, Terminal, or Utilities > Share Disk.\n");
+		}
 		logger(LL_INFO, "DONE\n");
 		idevicerestore_progress(client, RESTORE_NUM_STEPS-1, 1.0);
 	} else {
@@ -1656,6 +1769,23 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 		plist_free(client->preflight_info);
 	}
 	free(client->restore_variant);
+	if (client->skip_components) {
+		int i;
+		for (i = 0; client->skip_components[i]; i++) {
+			free(client->skip_components[i]);
+		}
+		free(client->skip_components);
+	}
+	if (client->restore_option_overrides) {
+		plist_free(client->restore_option_overrides);
+	}
+	if (client->nvram_sets) {
+		int i;
+		for (i = 0; client->nvram_sets[i]; i++) {
+			free(client->nvram_sets[i]);
+		}
+		free(client->nvram_sets);
+	}
 	free(client);
 }
 
@@ -1978,6 +2108,135 @@ int main(int argc, char* argv[])
 			logfile = optarg;
 			break;
 
+		case 4:
+			client->flags |= FLAG_RECOVERY_OS_ONLY;
+			break;
+
+		case 5:
+			client->flags |= FLAG_DIAGNOSE;
+			break;
+
+		case 6: {
+			/* comma separated, and the option may be given more than once */
+			char* list = strdup(optarg);
+			char* tok = strtok(list, ",");
+			while (tok) {
+				while (*tok == ' ') tok++;
+				if (*tok) {
+					int n = 0;
+					while (client->skip_components && client->skip_components[n]) n++;
+					char** grown = realloc(client->skip_components, (n + 2) * sizeof(char*));
+					if (!grown) {
+						logger(LL_ERROR, "Out of memory\n");
+						free(list);
+						return EXIT_FAILURE;
+					}
+					client->skip_components = grown;
+					client->skip_components[n] = strdup(tok);
+					client->skip_components[n + 1] = NULL;
+				}
+				tok = strtok(NULL, ",");
+			}
+			free(list);
+			break;
+		}
+
+		case 7: {
+			/* KEY=VALUE, where VALUE is true/false, a number, or a string.
+			 * KEY alone means true. */
+			char* spec = strdup(optarg);
+			char* eq = strchr(spec, '=');
+			plist_t value = NULL;
+			if (!eq) {
+				value = plist_new_bool(1);
+			} else {
+				*eq = '\0';
+				const char* v = eq + 1;
+				if (!strcasecmp(v, "true") || !strcasecmp(v, "yes")) {
+					value = plist_new_bool(1);
+				} else if (!strcasecmp(v, "false") || !strcasecmp(v, "no")) {
+					value = plist_new_bool(0);
+				} else {
+					char* tail = NULL;
+					uint64_t num = strtoull(v, &tail, 0);
+					if (*v && tail && *tail == '\0') {
+						value = plist_new_uint(num);
+					} else {
+						value = plist_new_string(v);
+					}
+				}
+			}
+			if (!*spec) {
+				logger(LL_ERROR, "--restore-option requires a key\n");
+				free(spec);
+				plist_free(value);
+				return EXIT_FAILURE;
+			}
+			if (!client->restore_option_overrides) {
+				client->restore_option_overrides = plist_new_dict();
+			}
+			plist_dict_set_item(client->restore_option_overrides, spec, value);
+			free(spec);
+			break;
+		}
+
+		case 8:
+			client->flags |= FLAG_NO_VERIFY;
+			break;
+
+		case 9: {
+			/* KEY=PATH, where PATH is an XML plist holding the value. Needed for
+			 * options whose value is a dictionary or an array. */
+			char* spec = strdup(optarg);
+			char* eq = strchr(spec, '=');
+			if (!eq || eq == spec || !*(eq+1)) {
+				logger(LL_ERROR, "--restore-option-plist needs KEY=PATH\n");
+				free(spec);
+				return EXIT_FAILURE;
+			}
+			*eq = '\0';
+			void* pdata = NULL;
+			size_t plen = 0;
+			if (read_file(eq+1, &pdata, &plen) != 0) {
+				logger(LL_ERROR, "Could not read %s\n", eq+1);
+				free(spec);
+				return EXIT_FAILURE;
+			}
+			plist_t pval = NULL;
+			plist_from_memory((const char*)pdata, (uint32_t)plen, &pval, NULL);
+			free(pdata);
+			if (!pval) {
+				logger(LL_ERROR, "Could not parse %s as a plist\n", eq+1);
+				free(spec);
+				return EXIT_FAILURE;
+			}
+			if (!client->restore_option_overrides) {
+				client->restore_option_overrides = plist_new_dict();
+			}
+			plist_dict_set_item(client->restore_option_overrides, spec, pval);
+			logger(LL_INFO, "Restore option %s loaded from %s\n", spec, eq+1);
+			free(spec);
+			break;
+		}
+
+		case 10:
+			client->flags |= FLAG_NO_FUD;
+			break;
+
+		case 11: {
+			int n = 0;
+			while (client->nvram_sets && client->nvram_sets[n]) n++;
+			char** grown = realloc(client->nvram_sets, (n + 2) * sizeof(char*));
+			if (!grown) {
+				logger(LL_ERROR, "Out of memory\n");
+				return EXIT_FAILURE;
+			}
+			client->nvram_sets = grown;
+			client->nvram_sets[n] = strdup(optarg);
+			client->nvram_sets[n + 1] = NULL;
+			break;
+		}
+
 		default:
 			usage(argc, argv, 1);
 			return EXIT_FAILURE;
@@ -2005,6 +2264,26 @@ int main(int argc, char* argv[])
 
 	if ((client->flags & FLAG_LATEST) && (client->flags & FLAG_CUSTOM)) {
 		logger(LL_ERROR, "You can't use --custom and --latest options at the same time.\n");
+		return EXIT_FAILURE;
+	}
+
+	if (client->flags & FLAG_RECOVERY_OS_ONLY) {
+		if (client->flags & FLAG_ERASE) {
+			logger(LL_ERROR, "You can't use --recovery-os-only and --erase options at the same time.\n");
+			return EXIT_FAILURE;
+		}
+		if (client->flags & FLAG_CUSTOM) {
+			logger(LL_ERROR, "You can't use --recovery-os-only and --custom options at the same time.\n");
+			return EXIT_FAILURE;
+		}
+		if (client->flags & FLAG_DIAGNOSE) {
+			logger(LL_ERROR, "You can't use --recovery-os-only and --diagnose options at the same time.\n");
+			return EXIT_FAILURE;
+		}
+	}
+
+	if ((client->flags & FLAG_DIAGNOSE) && (client->flags & FLAG_ERASE)) {
+		logger(LL_ERROR, "You can't use --diagnose and --erase options at the same time.\n");
 		return EXIT_FAILURE;
 	}
 
@@ -2954,7 +3233,7 @@ void build_identity_print_information(plist_t build_identity)
 	node = NULL;
 }
 
-int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw)
+int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw, char** skip_components)
 {
 	plist_t manifest_node = plist_dict_get_item(build_identity, "Manifest");
 	if (!manifest_node || plist_get_node_type(manifest_node) != PLIST_DICT) {
@@ -2970,6 +3249,21 @@ int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive
 		key = NULL;
 		plist_dict_next_item(manifest_node, iter, &key, &node);
 		if (key && node) {
+			/* a component that is never going to be sent doesn't have to be in the
+			 * IPSW, so a missing one must not abort the restore */
+			int skipped = 0;
+			int i;
+			for (i = 0; skip_components && skip_components[i]; i++) {
+				if (!strcmp(skip_components[i], key)) {
+					skipped = 1;
+					break;
+				}
+			}
+			if (skipped) {
+				logger(LL_WARNING, "Not checking skipped component %s in IPSW\n", key);
+				free(key);
+				continue;
+			}
 			plist_t path = plist_access_path(node, 2, "Info", "Path");
 			if (path) {
 				char *comp_path = NULL;

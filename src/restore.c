@@ -740,20 +740,31 @@ static void _restore_service_free(restore_service_client_t service)
 
 static int lastop = 0;
 
-static int restore_handle_previous_restore_log_msg(restored_client_t client, plist_t msg)
+static int restore_handle_previous_restore_log_msg(struct idevicerestore_client_t* client, plist_t msg)
 {
 	plist_t node = NULL;
-	char* restorelog = NULL;
+	uint64_t len = 0;
+	const char* restorelog = NULL;
 
 	node = plist_dict_get_item(msg, "PreviousRestoreLog");
 	if (!node || plist_get_node_type(node) != PLIST_STRING) {
 		logger(LL_DEBUG, "Failed to parse restore log from PreviousRestoreLog plist\n");
 		return -1;
 	}
-	plist_get_string_val(node, &restorelog);
+	restorelog = plist_get_string_ptr(node, &len);
 
 	logger(LL_VERBOSE, "Previous Restore Log Received:\n%s\n", restorelog);
-	free(restorelog);
+
+	/* the log of the restore that failed before this one is worth keeping */
+	char path[PATH_MAX];
+	if (client->cache_dir) {
+		snprintf(path, sizeof(path), "%s/previous_restore_%016" PRIx64 ".log", client->cache_dir, client->ecid);
+	} else {
+		snprintf(path, sizeof(path), "previous_restore_%016" PRIx64 ".log", client->ecid);
+	}
+	if (len > 0 && write_file(path, restorelog, (size_t)len) >= 0) {
+		logger(LL_INFO, "Log of the previous restore attempt saved to %s\n", path);
+	}
 
 	return 0;
 }
@@ -1016,6 +1027,27 @@ static void restore_asr_progress_cb(double progress, void* userdata)
 	}
 }
 
+/* Returns the component of a recoveryOS build identity that holds the actual
+ * recoveryOS volume. On an Apple Silicon Mac that is BaseSystem; the 'OS' entry of
+ * the 'macOS Customer' identity points at the full system image instead. Devices
+ * using a plain RecoveryVariant only ship the recoveryOS as 'OS'. */
+static const char* _restore_recovery_os_image_component(struct idevicerestore_client_t* client, plist_t recovery_identity)
+{
+	if (client->macos_variant && build_identity_has_component(recovery_identity, "BaseSystem")) {
+		return "BaseSystem";
+	}
+	return "OS";
+}
+
+/* The recoveryOS build identity, for both the macOS and the RecoveryVariant case. */
+static plist_t _restore_get_recovery_os_identity(struct idevicerestore_client_t* client)
+{
+	if (client->recovery_variant) {
+		return client->recovery_variant;
+	}
+	return client->macos_variant;
+}
+
 int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t message)
 {
 	asr_client_t asr = NULL;
@@ -1028,25 +1060,46 @@ int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t mess
 		return -1;
 	}
 
-	logger(LL_INFO, "About to send filesystem...\n");
+	const char* data_type = plist_get_string_ptr(plist_dict_get_item(message, "DataType"), NULL);
+	int is_recovery_os = (data_type && !strcmp(data_type, "RecoveryOSASRImage"))
+		|| plist_dict_get_bool(plist_dict_get_item(message, "Arguments"), "IsRecoveryOS");
 
-	if (build_identity_get_component_path(client->restore->build_identity, "OS", &fsname) < 0) {
-		logger(LL_ERROR, "Unable to get path for filesystem component\n");
-		return -1;
-	}
-	if (client->filesystem) {
-		char* path = strdup(client->filesystem);
-		const char* fsname_base = path_get_basename(path);
-		char* parent_dir = dirname(path);
-		ipsw_dummy = ipsw_open(parent_dir);
-		file = ipsw_file_open(ipsw_dummy, fsname_base);
-		free(path);
-	} else {
+	if (is_recovery_os) {
+		plist_t recovery_identity = _restore_get_recovery_os_identity(client);
+		if (!recovery_identity) {
+			logger(LL_ERROR, "No recoveryOS build identity available\n");
+			return -1;
+		}
+		const char* component = _restore_recovery_os_image_component(client, recovery_identity);
+		logger(LL_INFO, "About to send recoveryOS filesystem (%s)...\n", component);
+		if (build_identity_get_component_path(recovery_identity, component, &fsname) < 0) {
+			logger(LL_ERROR, "Unable to get path for recoveryOS filesystem component %s\n", component);
+			return -1;
+		}
 		file = ipsw_file_open(client->ipsw, fsname);
+	} else {
+		logger(LL_INFO, "About to send filesystem...\n");
+
+		if (build_identity_get_component_path(client->restore->build_identity, "OS", &fsname) < 0) {
+			logger(LL_ERROR, "Unable to get path for filesystem component\n");
+			return -1;
+		}
+		if (client->filesystem) {
+			char* path = strdup(client->filesystem);
+			const char* fsname_base = path_get_basename(path);
+			char* parent_dir = dirname(path);
+			ipsw_dummy = ipsw_open(parent_dir);
+			file = ipsw_file_open(ipsw_dummy, fsname_base);
+			free(path);
+		} else {
+			file = ipsw_file_open(client->ipsw, fsname);
+		}
 	}
 	if (!file) {
 		logger(LL_ERROR, "Unable to open '%s' in ipsw\n", fsname);
 		free(fsname);
+		ipsw_close(ipsw_dummy);
+		return -1;
 	}
 
 	uint16_t asr_port = (uint16_t)plist_dict_get_uint(message, "DataPort");
@@ -2450,6 +2503,20 @@ int restore_send_fdr_trust_data(struct idevicerestore_client_t* client, plist_t 
 	return 0;
 }
 
+int restore_component_is_skipped(struct idevicerestore_client_t* client, const char* component)
+{
+	if (!client->skip_components || !component) {
+		return 0;
+	}
+	int i;
+	for (i = 0; client->skip_components[i]; i++) {
+		if (!strcmp(client->skip_components[i], component)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int restore_send_image_data(struct idevicerestore_client_t *client, plist_t message, const char *image_list_k, const char *image_type_k, const char *image_data_k)
 {
 	restored_error_t restore_error;
@@ -2489,6 +2556,13 @@ static int restore_send_image_data(struct idevicerestore_client_t *client, plist
 		logger(LL_INFO, "About to send %s...\n", image_data_k);
 	}
 
+	/* Offering no FUD data at all makes the device's copy_fud_data() return NULL,
+	 * which happens before its AHT updater touches any device. */
+	int suppress_all = (client->flags & FLAG_NO_FUD) && !strcmp(image_type_k, "IsFUDFirmware");
+	if (suppress_all) {
+		logger(LL_WARNING, "Not offering any %s component as requested\n", image_type_k);
+	}
+
 	if (want_image_list) {
 		matched_images = plist_new_array();
 	} else {
@@ -2511,6 +2585,15 @@ static int restore_send_image_data(struct idevicerestore_client_t *client, plist
 				plist_t is_image_type_node = plist_access_path(manifest_entry, 2, "Info", image_type_k);
 				if (is_image_type_node && plist_get_node_type(is_image_type_node) == PLIST_BOOLEAN) {
 					plist_get_bool_val(is_image_type_node, &is_image_type);
+				}
+				if (is_image_type && suppress_all) {
+					is_image_type = 0;
+				}
+				if (is_image_type && restore_component_is_skipped(client, component)) {
+					/* Withholding the firmware keeps the device from running the
+					 * updater for it at all, which is the point of --skip-firmware. */
+					logger(LL_WARNING, "Not offering %s component %s as requested\n", image_type_k, component);
+					is_image_type = 0;
 				}
 				if (is_image_type) {
 					if (want_image_list) {
@@ -4538,8 +4621,23 @@ int restore_send_buildidentity(struct idevicerestore_client_t* client, plist_t m
 
 	plist_t build_identity = restore_get_build_identity_from_request(client, message);
 
+	/* Withholding the image only makes the updater fail when it asks for it. Taking
+	 * the component out of the identity the device receives means the device never
+	 * learns the firmware exists, which may make it skip the updater instead. */
+	plist_t identity_copy = plist_copy(build_identity);
+	if (client->skip_components) {
+		plist_t manifest = plist_dict_get_item(identity_copy, "Manifest");
+		int i;
+		for (i = 0; manifest && client->skip_components[i]; i++) {
+			if (plist_dict_get_item(manifest, client->skip_components[i])) {
+				logger(LL_WARNING, "Removing %s from the BuildIdentityDict sent to the device\n", client->skip_components[i]);
+				plist_dict_remove_item(manifest, client->skip_components[i]);
+			}
+		}
+	}
+
 	dict = plist_new_dict();
-	plist_dict_set_item(dict, "BuildIdentityDict", plist_copy(build_identity));
+	plist_dict_set_item(dict, "BuildIdentityDict", identity_copy);
 
 	plist_t node = plist_access_path(message, 2, "Arguments", "Variant");
 	if(node) {
@@ -4638,7 +4736,7 @@ int restore_send_recovery_os_file_asset_image(struct idevicerestore_client_t* cl
 
 int restore_send_recovery_os_iboot_fw_files_images(struct idevicerestore_client_t* client, plist_t message)
 {
-	plist_t build_id_manifest = plist_dict_get_item(client->recovery_variant, "Manifest");
+	plist_t build_id_manifest = plist_dict_get_item(_restore_get_recovery_os_identity(client), "Manifest");
 	if (!build_id_manifest) {
 		logger(LL_ERROR, "Missing Manifest dictionary in build identity?!\n");
 		return -1;
@@ -4717,9 +4815,14 @@ int restore_send_recovery_os_iboot_fw_files_images(struct idevicerestore_client_
 
 int restore_send_recovery_os_image(struct idevicerestore_client_t* client, plist_t message)
 {
-	const char* component = "OS";
+	plist_t recovery_identity = _restore_get_recovery_os_identity(client);
+	if (!recovery_identity) {
+		logger(LL_ERROR, "No recoveryOS build identity available\n");
+		return -1;
+	}
+	const char* component = _restore_recovery_os_image_component(client, recovery_identity);
 	char* path = NULL;
-	if (build_identity_get_component_path(client->recovery_variant, component, &path) < 0) {
+	if (build_identity_get_component_path(recovery_identity, component, &path) < 0) {
 		logger(LL_ERROR, "Unable to find %s path from build identity\n", component);
 		return -1;
 	}
@@ -4766,7 +4869,7 @@ int restore_send_recovery_os_image(struct idevicerestore_client_t* client, plist
 
 int restore_send_recovery_os_version_data(struct idevicerestore_client_t* client, plist_t message)
 {
-	plist_t build_id_info = plist_dict_get_item(client->recovery_variant, "Info");
+	plist_t build_id_info = plist_dict_get_item(_restore_get_recovery_os_identity(client), "Info");
 	if (!build_id_info) {
 		logger(LL_ERROR, "Missing Info dictionary in build identity?!\n");
 		return -1;
@@ -4804,6 +4907,13 @@ int restore_handle_data_request_msg(struct idevicerestore_client_t* client, plis
 logger(LL_DEBUG, "%s: type = %s\n", __func__, type);
 		// this request is sent when restored is ready to receive the filesystem
 		if (!strcmp(type, "SystemImageData")) {
+			if (client->flags & FLAG_RECOVERY_OS_ONLY) {
+				/* Sending the system image would overwrite the very data this mode is
+				 * meant to preserve, so refuse instead of guessing. */
+				logger(LL_ERROR, "The device requested the system image during a recoveryOS-only restore.\n");
+				logger(LL_ERROR, "Refusing to send it, as that would destroy the data on this Mac. Aborting.\n");
+				return -1;
+			}
 			if (restore_send_filesystem(client, message) < 0) {
 				logger(LL_ERROR, "Unable to send filesystem\n");
 				return -2;
@@ -5059,6 +5169,34 @@ static void* _restore_handle_async_data_request(void* args)
 	return NULL;
 }
 
+/* CrashLog is announced as supported in restore_supported_message_types(), so the
+ * device pushes crash logs to us when something dies during the restore. Keep them:
+ * on a failing restore they are often the only explanation available. */
+static int restore_handle_crash_log(struct idevicerestore_client_t* client, plist_t message)
+{
+	static int crash_log_index = 0;
+	logger(LL_INFO, "*** the device sent a crash log ***\n");
+	logger_dump_plist(LL_INFO, message, 1);
+
+	char path[PATH_MAX];
+	if (client->cache_dir) {
+		snprintf(path, sizeof(path), "%s/crashlog_%016" PRIx64 "_%d.plist", client->cache_dir, client->ecid, crash_log_index);
+	} else {
+		snprintf(path, sizeof(path), "crashlog_%016" PRIx64 "_%d.plist", client->ecid, crash_log_index);
+	}
+	char* xml = NULL;
+	uint32_t xml_len = 0;
+	plist_to_xml(message, &xml, &xml_len);
+	if (xml) {
+		if (write_file(path, xml, xml_len) >= 0) {
+			logger(LL_INFO, "Crash log saved to %s\n", path);
+			crash_log_index++;
+		}
+		plist_mem_free(xml);
+	}
+	return 0;
+}
+
 static int restore_handle_restored_crash(struct idevicerestore_client_t* client, plist_t message)
 {
 	plist_t backtrace = plist_dict_get_item(message, "RestoredBacktrace");
@@ -5271,6 +5409,105 @@ static void rp_status_cb(reverse_proxy_client_t client, reverse_proxy_status_t s
 }
 #endif
 
+static void _restore_save_diag_text(const char* dir, const char* name, plist_t node)
+{
+	if (!PLIST_IS_STRING(node)) {
+		return;
+	}
+	uint64_t len = 0;
+	const char* text = plist_get_string_ptr(node, &len);
+	if (!text || len == 0) {
+		return;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	if (write_file(path, text, (size_t)len) < 0) {
+		return;
+	}
+	logger(LL_INFO, "Saved %s (%" PRIu64 " bytes)\n", path, len);
+}
+
+static void _restore_save_diag_plist(const char* dir, const char* name, plist_t plist)
+{
+	if (!plist) {
+		return;
+	}
+	char* xml = NULL;
+	uint32_t xml_len = 0;
+	plist_to_xml(plist, &xml, &xml_len);
+	if (!xml) {
+		return;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	if (write_file(path, xml, xml_len) >= 0) {
+		logger(LL_INFO, "Saved %s\n", path);
+	}
+	plist_mem_free(xml);
+}
+
+int restore_collect_diagnostics(struct idevicerestore_client_t* client)
+{
+	int err = restore_open_with_timeout(client);
+	if (err < 0) {
+		logger(LL_ERROR, "Unable to open device in restore mode\n");
+		return -1;
+	}
+	restored_client_t restore = client->restore->client;
+
+	char dir[PATH_MAX];
+	if (diagnostics_dir(client, dir, sizeof(dir)) < 0) {
+		restore_client_free(client);
+		return -1;
+	}
+	logger(LL_INFO, "Collecting diagnostics into %s\n", dir);
+
+	plist_t hwinfo = NULL;
+	if (restored_query_value(restore, "HardwareInfo", &hwinfo) == RESTORE_E_SUCCESS) {
+		logger(LL_INFO, "Hardware information:\n");
+		logger(LL_INFO, "  ChipID: 0x%" PRIx64 "\n", plist_dict_get_uint(hwinfo, "ChipID"));
+		logger(LL_INFO, "  BoardID: 0x%" PRIx64 "\n", plist_dict_get_uint(hwinfo, "BoardID"));
+		logger(LL_INFO, "  UniqueChipID: %" PRIu64 "\n", plist_dict_get_uint(hwinfo, "UniqueChipID"));
+		logger(LL_INFO, "  ProductionMode: %s\n", plist_dict_get_bool(hwinfo, "ProductionMode") ? "true" : "false");
+		logger(LL_INFO, "  SecurityMode: %s\n", plist_dict_get_bool(hwinfo, "SecurityMode") ? "true" : "false");
+		logger(LL_INFO, "  EffectiveSecurityMode: %s\n", plist_dict_get_bool(hwinfo, "EffectiveSecurityMode") ? "true" : "false");
+		_restore_save_diag_plist(dir, "HardwareInfo.plist", hwinfo);
+		plist_free(hwinfo);
+	} else {
+		logger(LL_WARNING, "The device did not return any hardware information\n");
+	}
+
+	/* This is where the device hands over what it recorded about its previous boot
+	 * and its previous restore attempt: the exit status, the USB log and, most
+	 * importantly, the panic log of the boot that failed. */
+	plist_t dbginfo = NULL;
+	if (restored_query_value(restore, "SavedDebugInfo", &dbginfo) == RESTORE_E_SUCCESS) {
+		_restore_save_diag_plist(dir, "SavedDebugInfo.plist", dbginfo);
+
+		plist_t node = plist_dict_get_item(dbginfo, "PreviousExitStatus");
+		if (PLIST_IS_STRING(node)) {
+			logger(LL_INFO, "Previous restore exit status: %s\n", plist_get_string_ptr(node, NULL));
+		}
+		node = plist_dict_get_item(dbginfo, "PanicLog");
+		if (PLIST_IS_STRING(node)) {
+			logger(LL_NOTICE, "The device has a panic log from a failed boot.\n");
+			_restore_save_diag_text(dir, "panic.log", node);
+		} else {
+			logger(LL_INFO, "No panic log stored on the device\n");
+		}
+		_restore_save_diag_text(dir, "usb.log", plist_dict_get_item(dbginfo, "USBLog"));
+		plist_free(dbginfo);
+	} else {
+		logger(LL_INFO, "The device did not return any saved debug info\n");
+	}
+
+	logger(LL_INFO, "Diagnostics collected. Nothing was written to the storage of the device.\n");
+	logger(LL_INFO, "The device is still running the restore ramdisk; power-cycle it to leave this state.\n");
+
+	restore_client_free(client);
+	return 0;
+}
+
 int restore_device(struct idevicerestore_client_t* client, plist_t build_identity)
 {
 	int err = 0;
@@ -5427,7 +5664,12 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 
 	// FIXME: Should be adjusted for update behaviors
 	if (client->macos_variant) {
-		plist_dict_set_item(opts, "AddSystemPartitionPadding", plist_new_bool(1));
+		/* A recoveryOS-only restore (what Apple Configurator calls a "revive") only
+		 * reinstalls the firmware and the recoveryOS partition. The system and data
+		 * volumes must be left completely untouched, so everything that would create,
+		 * reformat, resize or write them has to be turned off. */
+		int recovery_os_only = (client->flags & FLAG_RECOVERY_OS_ONLY) ? 1 : 0;
+		plist_dict_set_item(opts, "AddSystemPartitionPadding", plist_new_bool(!recovery_os_only));
 		plist_dict_set_item(opts, "AllowUntetheredRestore", plist_new_bool(0));
 		plist_dict_set_item(opts, "AuthInstallEnableSso", plist_new_bool(0));
 		char *macos_variant = NULL;
@@ -5440,9 +5682,9 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		plist_dict_set_item(opts, "AutoBootDelay", plist_new_uint(0));
 		plist_dict_set_item(opts, "BasebandUpdaterOutputPath", plist_new_bool(1));
 		plist_dict_set_item(opts, "DisableUserAuthentication", plist_new_bool(1));
-		plist_dict_set_item(opts, "FitSystemPartitionToContent", plist_new_bool(1));
+		plist_dict_set_item(opts, "FitSystemPartitionToContent", plist_new_bool(!recovery_os_only));
 		plist_dict_set_item(opts, "FlashNOR", plist_new_bool(1));
-		plist_dict_set_item(opts, "FormatForAPFS", plist_new_bool(1));
+		plist_dict_set_item(opts, "FormatForAPFS", plist_new_bool(!recovery_os_only));
 		plist_dict_set_item(opts, "FormatForLwVM", plist_new_bool(0));
 		plist_dict_set_item(opts, "InstallDiags", plist_new_bool(0));
 		plist_dict_set_item(opts, "InstallRecoveryOS", plist_new_bool(1));
@@ -5450,7 +5692,7 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		plist_dict_set_item(opts, "MacOSVariantPresent", plist_new_bool(1));
 		plist_dict_set_item(opts, "MinimumBatteryVoltage", plist_new_uint(0)); // FIXME: Should be adjusted for M1 macbooks (if needed)
 		plist_dict_set_item(opts, "RecoveryOSUnpack", plist_new_bool(1));
-		plist_dict_set_item(opts, "ShouldRestoreSystemImage", plist_new_bool(1));
+		plist_dict_set_item(opts, "ShouldRestoreSystemImage", plist_new_bool(!recovery_os_only));
 		plist_dict_set_item(opts, "SkipPreflightPersonalization", plist_new_bool(0));
 		plist_dict_set_item(opts, "UpdateBaseband", plist_new_bool(1));
 		// FIXME: I don't know where this number comes from yet. It seems like it matches this part of the build identity:
@@ -5459,9 +5701,13 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		//  But i can't seem to find a plausible formula
 		// It did work with multiple macOS versions
 		plist_dict_set_item(opts, "recoveryOSPartitionSize", plist_new_uint(58201));
-		plist_t msp = plist_access_path(build_identity, 2, "Info", "MinimumSystemPartition");
-		if (msp) {
-			plist_dict_set_item(opts, "SystemPartitionSize", plist_copy(msp));
+		if (!recovery_os_only) {
+			/* don't tell restored anything about the size of the system partition,
+			 * it must be left exactly as it is */
+			plist_t msp = plist_access_path(build_identity, 2, "Info", "MinimumSystemPartition");
+			if (msp) {
+				plist_dict_set_item(opts, "SystemPartitionSize", plist_copy(msp));
+			}
 		}
 	} else {
 		// FIXME: new on iOS 5 ?
@@ -5551,8 +5797,14 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		plist_dict_set_item(opts, "UUID", plist_new_string(guid));
 		free(guid);
 	}
-	plist_dict_set_item(opts, "CreateFilesystemPartitions", plist_new_bool(1));
-	plist_dict_set_item(opts, "SystemImage", plist_new_bool(1));
+	if (client->flags & FLAG_RECOVERY_OS_ONLY) {
+		/* keep the existing partition layout and system image as they are */
+		plist_dict_set_item(opts, "CreateFilesystemPartitions", plist_new_bool(0));
+		plist_dict_set_item(opts, "SystemImage", plist_new_bool(0));
+	} else {
+		plist_dict_set_item(opts, "CreateFilesystemPartitions", plist_new_bool(1));
+		plist_dict_set_item(opts, "SystemImage", plist_new_bool(1));
+	}
 	if (client->restore_boot_args) {
 		plist_dict_set_item(opts, "RestoreBootArgs", plist_new_string(client->restore_boot_args));
 	}
@@ -5573,7 +5825,29 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 	}
 	plist_dict_set_item(opts, "SystemPartitionPadding", spp);
 
+	if (client->restore_option_overrides) {
+		plist_dict_iter oiter = NULL;
+		plist_dict_new_iter(client->restore_option_overrides, &oiter);
+		if (oiter) {
+			char* okey = NULL;
+			plist_t oval = NULL;
+			do {
+				okey = NULL;
+				oval = NULL;
+				plist_dict_next_item(client->restore_option_overrides, oiter, &okey, &oval);
+				if (okey && oval) {
+					logger(LL_WARNING, "Overriding restore option %s\n", okey);
+				}
+				free(okey);
+			} while (oval);
+			plist_mem_free(oiter);
+		}
+		plist_dict_merge(&opts, client->restore_option_overrides);
+	}
+
 	// start the restore process
+	logger(LL_VERBOSE, "Restore options:\n");
+	logger_dump_plist(LL_VERBOSE, opts, 1);
 	restore_error = restored_start_restore(restore, opts, client->restore->protocol_version);
 	if (restore_error != RESTORE_E_SUCCESS) {
 		logger(LL_ERROR, "Unable to start the restore process\n");
@@ -5655,7 +5929,7 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 
 		// restore logs are available if a previous restore failed
 		else if (!strcmp(type, "PreviousRestoreLogMsg")) {
-			err = restore_handle_previous_restore_log_msg(restore, message);
+			err = restore_handle_previous_restore_log_msg(client, message);
 		}
 
 		// progress notification messages sent by the restored inform the client
@@ -5735,6 +6009,11 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 		// handle restored crash, print backtrace
 		else if (!strcmp(type, "RestoredCrash")) {
 			err = restore_handle_restored_crash(client, message);
+		}
+
+		// crash log pushed by the device
+		else if (!strcmp(type, "CrashLog")) {
+			err = restore_handle_crash_log(client, message);
 		}
 
 		// handle async wait

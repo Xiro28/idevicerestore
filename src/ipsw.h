@@ -76,7 +76,9 @@ int ipsw_extract_restore_plist(ipsw_archive_t ipsw, plist_t* restore_plist);
 int ipsw_list_contents(ipsw_archive_t ipsw, ipsw_list_cb cb, void *ctx);
 
 int ipsw_get_signed_firmwares(const char* product, plist_t* firmwares);
-int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir, char** ipswfile);
+/* skip_cached_verify: don't checksum an IPSW that is already present locally. A
+ * freshly downloaded one is still verified. */
+int ipsw_download_fw(const char *fwurl, unsigned char* isha1, const char* todir, char** ipswfile, int skip_cached_verify);
 
 int ipsw_get_latest_fw(plist_t version_data, const char* product, char** fwurl, unsigned char* sha1buf);
 int ipsw_download_latest_fw(plist_t version_data, const char* product, const char* todir, char** ipswfile);

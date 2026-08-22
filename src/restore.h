@@ -57,6 +57,8 @@ int restore_send_nor(struct idevicerestore_client_t* client, plist_t message);
 int restore_send_root_ticket(struct idevicerestore_client_t* client, plist_t message);
 int restore_send_component(struct idevicerestore_client_t* client, plist_t message, const char* component, const char* component_name);
 int restore_device(struct idevicerestore_client_t* client, plist_t build_identity);
+int restore_collect_diagnostics(struct idevicerestore_client_t* client);
+int restore_component_is_skipped(struct idevicerestore_client_t* client, const char* component);
 int restore_open_with_timeout(struct idevicerestore_client_t* client);
 int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t message);
 int restore_send_fdr_trust_data(struct idevicerestore_client_t* client, plist_t message);

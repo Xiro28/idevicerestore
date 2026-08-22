@@ -54,6 +54,8 @@ int recovery_send_loaded_by_iboot(struct idevicerestore_client_t* client, plist_
 int recovery_send_reset(struct idevicerestore_client_t* client);
 int recovery_send_ticket(struct idevicerestore_client_t* client);
 int recovery_set_autoboot(struct idevicerestore_client_t* client, int enable);
+int recovery_dump_environment(struct idevicerestore_client_t* client);
+int recovery_apply_nvram(struct idevicerestore_client_t* client);
 int recovery_is_image4_supported(struct idevicerestore_client_t* client);
 int recovery_get_ap_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size);
 int recovery_get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce, unsigned int* nonce_size);

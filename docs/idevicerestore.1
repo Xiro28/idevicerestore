@@ -39,6 +39,30 @@ Perform full restore instead of update, erasing all data
 
 \f[B]DO NOT USE\f[] if you want to preserve user data on the device!
 .TP
+.B \-\-recovery\-os\-only, \-\-revive
+Apple Silicon Mac only: reinstall the firmware and the recoveryOS
+("Recovery Options") partition only, leaving the system and data volumes
+untouched. This is the operation Apple Configurator calls \f[B]Revive\f[].
+
+Use it to make an unbootable Mac reach recoveryOS again, so that the data can
+be copied off it from there (Disk Utility, Terminal, or Share Disk). Once the
+Mac reboots, keep the power button pressed to boot into recoveryOS.
+
+The system image is not sent in this mode, so it does not need to be extracted
+from the IPSW. This option cannot be combined with \f[B]\-e\f[] or
+\f[B]\-c\f[].
+.TP
+.B \-\-diagnose
+Boot the restore ramdisk and collect the diagnostic information the device is
+able to report about itself: hardware information, the previous restore exit
+status, the USB log and the panic log of the boot that failed. Everything is
+saved into a \f[B]diagnostics_<ECID>\f[] directory and the tool exits without
+writing anything to the storage of the device.
+
+Use this first on a device that holds data you need: the panic log usually tells
+whether the failure is in the storage controller, in the filesystem or in the
+boot policy, which decides whether attempting a restore is worthwhile at all.
+.TP
 .B \-y, \-\-no\-input
 Non-interactive mode, do not ask for any input.
 

@@ -103,6 +103,128 @@ int recovery_client_new(struct idevicerestore_client_t* client)
 	return 0;
 }
 
+/* iBoot NVRAM variables worth having when a Mac refuses to boot. Anything unset
+ * simply comes back empty. Only readable in recovery mode: in DFU the device is
+ * still running iBSS/SecureROM, which has no access to NVRAM at all. */
+static const char* recovery_env_vars[] = {
+	"iboot-failure-reason", "boot-command", "one-time-boot-command", "auto-boot",
+	"recovery-boot-mode", "boot-args", "bootdelay", "boot-stage", "build-version",
+	"build-style", "policy-nonce-digest", "nonce-seeds", "root-live-fs",
+	"iboot-error-count", "panic-info", "backlight-level",
+	/* iBoot records the reason for a failed boot both numerically and as text */
+	"iboot-failure-reason-str", "iboot-failure-volume",
+	/* breadcrumbs left across failed boots */
+	"failboot-breadcrumbs", "breadcrumbs-stage-one", "breadcrumbs-stage-two",
+	"recovery-breadcrumbs", "ota-breadcrumbs", "panicmedic-timestamps",
+	"recovery-snag-key-pressed", "upgrade-fallback-boot-command",
+	/* recorded by the OS/iBoot across failed boots */
+	"boot_errors", "boot-breadcrumbs", "panicmedic", "osenvironment",
+	"policy-nonce-digests", "auto-fsck-failure-override-type", "aapl,panic-info",
+	"40A0DDD2-77F8-4392-B4A3-1E7304206516:panicmedic",
+	"40A0DDD2-77F8-4392-B4A3-1E7304206516:boot_errors",
+	"40A0DDD2-77F8-4392-B4A3-1E7304206516:boot-breadcrumbs",
+	"40A0DDD2-77F8-4392-B4A3-1E7304206516:iboot-failure-reason",
+	NULL
+};
+
+int recovery_dump_environment(struct idevicerestore_client_t* client)
+{
+	if (client->recovery == NULL) {
+		if (recovery_client_new(client) < 0) {
+			return -1;
+		}
+	}
+
+	char dir[1024];
+	if (diagnostics_dir(client, dir, sizeof(dir)) < 0) {
+		return -1;
+	}
+	char path[1088];
+	snprintf(path, sizeof(path), "%s/iboot-env.txt", dir);
+	FILE* f = fopen(path, "wb");
+
+	logger(LL_INFO, "iBoot environment:\n");
+	int i;
+	for (i = 0; recovery_env_vars[i]; i++) {
+		char* value = NULL;
+		irecv_getenv(client->recovery->client, recovery_env_vars[i], &value);
+		if (value && *value) {
+			logger(LL_INFO, "  %s = %s\n", recovery_env_vars[i], value);
+			if (f) fprintf(f, "%s=%s\n", recovery_env_vars[i], value);
+		} else {
+			logger(LL_VERBOSE, "  %s = (unset)\n", recovery_env_vars[i]);
+			if (f) fprintf(f, "%s=\n", recovery_env_vars[i]);
+		}
+		free(value);
+	}
+	if (f) {
+		fclose(f);
+		logger(LL_INFO, "Saved %s\n", path);
+	} else {
+		logger(LL_ERROR, "Could not write %s\n", path);
+	}
+
+	return 0;
+}
+
+/* Sets iBoot NVRAM variables and persists them. Only possible in recovery mode:
+ * DFU runs iBSS/SecureROM, which has no NVRAM access. */
+int recovery_apply_nvram(struct idevicerestore_client_t* client)
+{
+	if (!client->nvram_sets) {
+		return 0;
+	}
+	if (client->recovery == NULL) {
+		if (recovery_client_new(client) < 0) {
+			return -1;
+		}
+	}
+	int i;
+	for (i = 0; client->nvram_sets[i]; i++) {
+		char* spec = strdup(client->nvram_sets[i]);
+		char* eq = strchr(spec, '=');
+		char cmd[512];
+		if (eq) {
+			*eq = '\0';
+			snprintf(cmd, sizeof(cmd), "setenv %s %s", spec, eq + 1);
+		} else {
+			snprintf(cmd, sizeof(cmd), "setenv %s", spec);
+		}
+		logger(LL_INFO, "iBoot: %s\n", cmd);
+		if (irecv_send_command(client->recovery->client, cmd) != IRECV_E_SUCCESS) {
+			logger(LL_ERROR, "Failed to set NVRAM variable '%s'\n", spec);
+			free(spec);
+			return -1;
+		}
+		free(spec);
+	}
+	/* Our own DFU stage sets restore boot-args (rd=md0 ... -restore) with setenvnp,
+	 * i.e. deliberately non-persistent. saveenv would persist them, and a normal boot
+	 * would then ask for a ramdisk that isn't there and panic. Clear them unless the
+	 * caller is setting boot-args on purpose. */
+	int sets_boot_args = 0;
+	for (i = 0; client->nvram_sets[i]; i++) {
+		if (!strncmp(client->nvram_sets[i], "boot-args", 9)) {
+			sets_boot_args = 1;
+			break;
+		}
+	}
+	if (!sets_boot_args) {
+		logger(LL_INFO, "iBoot: setenv boot-args  (clearing restore boot-args before saving)\n");
+		if (irecv_send_command(client->recovery->client, "setenv boot-args") != IRECV_E_SUCCESS) {
+			logger(LL_WARNING, "Could not clear boot-args; they may be persisted by saveenv\n");
+		}
+	}
+
+	logger(LL_INFO, "iBoot: saveenv\n");
+	if (irecv_send_command(client->recovery->client, "saveenv") != IRECV_E_SUCCESS) {
+		logger(LL_ERROR, "Failed to save the environment\n");
+		return -1;
+	}
+	logger(LL_INFO, "NVRAM variables written and saved.\n");
+	return 0;
+}
+
 int recovery_set_autoboot(struct idevicerestore_client_t* client, int enable)
 {
 	irecv_error_t recovery_error = IRECV_E_SUCCESS;
